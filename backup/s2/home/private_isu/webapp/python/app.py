@@ -3,11 +3,13 @@ import os
 import pathlib
 import re
 import shlex
+import time
 import subprocess
 import tempfile
 
 import flask
 import MySQLdb.cursors
+from MySQLdb import OperationalError
 from flask_session import Session
 from jinja2 import pass_eval_context
 from markupsafe import Markup, escape
@@ -47,14 +49,23 @@ _db = None
 
 def db():
     global _db
-    if _db is None:
-        conf = config()["db"].copy()
-        conf["charset"] = "utf8mb4"
-        conf["cursorclass"] = MySQLdb.cursors.DictCursor
-        conf["autocommit"] = True
-        _db = MySQLdb.connect(**conf)
-    return _db
-
+    last = None
+    for _ in range(30):
+        try:
+            if _db is None:
+                conf = config()["db"].copy()
+                conf["charset"] = "utf8mb4"
+                conf["cursorclass"] = MySQLdb.cursors.DictCursor
+                conf["autocommit"] = True
+                conf["connect_timeout"] = 5
+                _db = MySQLdb.connect(**conf)
+            _db.ping(True)
+            return _db
+        except OperationalError as e:
+            last = e
+            _db = None
+            time.sleep(1)
+    raise last
 
 def db_initialize():
     cur = db().cursor()
