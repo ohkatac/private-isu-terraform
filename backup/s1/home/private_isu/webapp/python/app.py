@@ -141,39 +141,80 @@ def get_session_user():
 
 
 def make_posts(results, all_comments=False):
+    # 1 投稿ごとに comments / users / 件数を引いていた N+1 を、200 件ずつ 3 クエリにまとめる。
+    # results が 1 万件返る get_posts でも 20 件で止めるよう、チャンクごとに区切って
+    # 「クエリ -> 組み立て -> 20 件で break」を繰り返す。
     posts = []
     cursor = db().cursor()
-    for post in results:
-        cursor.execute(
-            "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = %s",
-            (post["id"],),
-        )
-        post["comment_count"] = cursor.fetchone()["count"]
+    users = {}
+    CHUNK = 200
 
-        query = (
-            "SELECT * FROM `comments` WHERE `post_id` = %s ORDER BY `created_at` DESC"
-        )
-        if not all_comments:
-            query += " LIMIT 3"
+    for start in range(0, len(results), CHUNK):
+        chunk_posts = results[start : start + CHUNK]
+        post_ids = [post["id"] for post in chunk_posts]
+        marks = ",".join(["%s"] * len(post_ids))
 
-        cursor.execute(query, (post["id"],))
-        comments = list(cursor)
-        for comment in comments:
+        if all_comments:
             cursor.execute(
-                "SELECT * FROM `users` WHERE `id` = %s", (comment["user_id"],)
+                "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` "
+                f"FROM `comments` WHERE `post_id` IN ({marks}) "
+                "ORDER BY `created_at` DESC",
+                post_ids,
             )
-            comment["user"] = cursor.fetchone()
-        comments.reverse()
-        post["comments"] = comments
+        else:
+            cursor.execute(
+                "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM ("
+                "SELECT `id`, `post_id`, `user_id`, `comment`, `created_at`, "
+                "ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS rn "
+                f"FROM `comments` WHERE `post_id` IN ({marks})"
+                ") AS t WHERE rn <= 3 ORDER BY `created_at` DESC",
+                post_ids,
+            )
+        comments_by_post = {}
+        user_ids = set()
+        for comment in cursor:
+            comments_by_post.setdefault(comment["post_id"], []).append(comment)
+            user_ids.add(comment["user_id"])
 
-        cursor.execute("SELECT * FROM `users` WHERE `id` = %s", (post["user_id"],))
-        post["user"] = cursor.fetchone()
+        cursor.execute(
+            f"SELECT `post_id`, COUNT(*) AS `count` FROM `comments` "
+            f"WHERE `post_id` IN ({marks}) GROUP BY `post_id`",
+            post_ids,
+        )
+        counts = {row["post_id"]: row["count"] for row in cursor}
 
-        if not post["user"]["del_flg"]:
-            posts.append(post)
+        user_ids.update(post["user_id"] for post in chunk_posts)
+        user_ids -= users.keys()
+        if user_ids:
+            umarks = ",".join(["%s"] * len(user_ids))
+            cursor.execute(
+                "SELECT `id`, `account_name`, `authority`, `del_flg`, `created_at` "
+                f"FROM `users` WHERE `id` IN ({umarks})",
+                list(user_ids),
+            )
+            for user in cursor:
+                users[user["id"]] = user
+
+        for post in chunk_posts:
+            post["comment_count"] = counts.get(post["id"], 0)
+
+            comments = comments_by_post.get(post["id"], [])
+            for comment in comments:
+                comment["user"] = users.get(comment["user_id"])
+            comments.reverse()
+            post["comments"] = comments
+
+            post["user"] = users.get(post["user_id"])
+
+            if not post["user"]["del_flg"]:
+                posts.append(post)
+
+            if len(posts) >= POSTS_PER_PAGE:
+                break
 
         if len(posts) >= POSTS_PER_PAGE:
             break
+
     return posts
 
 
@@ -296,7 +337,9 @@ def get_index():
 
     cursor = db().cursor()
     cursor.execute(
-        "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC"
+        "SELECT p.`id`, p.`user_id`, p.`body`, p.`created_at`, p.`mime` "
+        "FROM `posts` p JOIN `users` u ON u.`id` = p.`user_id` "
+        "WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT 20"
     )
     posts = make_posts(cursor.fetchall())
 
